@@ -2,9 +2,7 @@
 
 `osv-mirror-worker` is a small Cloudflare Worker that mirrors the OSV API endpoints used by Clawsec.
 
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/REPLACE_WITH_YOUR_GITHUB_OWNER/REPLACE_WITH_YOUR_REPOSITORY)
-
-Before publishing this README, replace `https://github.com/REPLACE_WITH_YOUR_GITHUB_OWNER/REPLACE_WITH_YOUR_REPOSITORY` with the final GitHub repository URL for this Worker project. Cloudflare uses that URL to import the project and trigger the deployment flow from the GitHub page.
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zweily/osv-mirror-worker)
 
 Supported paths:
 
