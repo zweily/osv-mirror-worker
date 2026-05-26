@@ -8,8 +8,11 @@ Supported paths:
 
 - `POST /v1/querybatch`
 - `GET /v1/vulns/{id}`
+- `GET /vulnerability/{id}`
 
 It is intentionally not an open proxy. Requests outside those paths return `404`.
+
+The `/vulnerability/{id}` route renders a human-readable advisory page on your mirror domain while `/v1/vulns/{id}` continues to return the raw OSV JSON payload.
 
 ## Use Case
 
@@ -26,6 +29,8 @@ clawsec report --database ./clawsec.sqlite3 --osv-base-url https://your-worker.w
 ```
 
 Clawsec accepts either the Worker origin or an explicit `/v1` base.
+
+When you use `--osv-base-url` during `clawsec scan` or `clawsec report`, OSV-backed report links now point to the mirror-hosted `/vulnerability/{id}` page instead of the raw JSON endpoint.
 
 ## Setup
 

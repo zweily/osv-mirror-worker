@@ -3,6 +3,55 @@ export interface Env {
 }
 
 const DEFAULT_OSV_ORIGIN = "https://api.osv.dev";
+const SUPPORTED_PATHS = ["POST /v1/querybatch", "GET /v1/vulns/{id}", "GET /vulnerability/{id}"];
+
+interface OsvSeverity {
+  type?: string;
+  score?: string;
+}
+
+interface OsvReference {
+  type?: string;
+  url?: string;
+}
+
+interface OsvPackage {
+  ecosystem?: string;
+  name?: string;
+  purl?: string;
+}
+
+interface OsvRangeEvent {
+  introduced?: string;
+  fixed?: string;
+  last_affected?: string;
+  limit?: string;
+}
+
+interface OsvAffectedRange {
+  type?: string;
+  repo?: string;
+  events?: OsvRangeEvent[];
+}
+
+interface OsvAffectedPackage {
+  package?: OsvPackage;
+  versions?: string[];
+  ranges?: OsvAffectedRange[];
+}
+
+interface OsvVulnerability {
+  id: string;
+  aliases?: string[];
+  summary?: string;
+  details?: string;
+  published?: string;
+  modified?: string;
+  withdrawn?: string;
+  severity?: OsvSeverity[];
+  references?: OsvReference[];
+  affected?: OsvAffectedPackage[];
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -18,17 +67,22 @@ export default {
           name: "osv-mirror-worker",
           status: "ok",
           upstream: normalizeOrigin(env.OSV_ORIGIN),
-          supportedPaths: ["POST /v1/querybatch", "GET /v1/vulns/{id}"],
+          supportedPaths: SUPPORTED_PATHS,
         },
         200,
       );
     }
 
-    if (!isSupportedPath(url.pathname, request.method)) {
+    const vulnerabilityPageId = getVulnerabilityPageId(url.pathname);
+    if (request.method === "GET" && vulnerabilityPageId) {
+      return serveVulnerabilityPage(url, env, vulnerabilityPageId);
+    }
+
+    if (!isSupportedApiPath(url.pathname, request.method)) {
       return json(
         {
           error: "Unsupported path",
-          supportedPaths: ["POST /v1/querybatch", "GET /v1/vulns/{id}"],
+          supportedPaths: SUPPORTED_PATHS,
         },
         404,
       );
@@ -68,7 +122,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-function isSupportedPath(pathname: string, method: string): boolean {
+function isSupportedApiPath(pathname: string, method: string): boolean {
   if (pathname === "/v1/querybatch") {
     return method === "POST";
   }
@@ -79,6 +133,24 @@ function isSupportedPath(pathname: string, method: string): boolean {
   }
 
   return false;
+}
+
+function getVulnerabilityPageId(pathname: string): string | null {
+  if (!pathname.startsWith("/vulnerability/")) {
+    return null;
+  }
+
+  const suffix = pathname.slice("/vulnerability/".length);
+  if (!suffix || suffix.includes("/")) {
+    return null;
+  }
+
+  try {
+    const vulnerabilityId = decodeURIComponent(suffix);
+    return vulnerabilityId && !vulnerabilityId.includes("/") ? vulnerabilityId : null;
+  } catch {
+    return null;
+  }
 }
 
 function normalizeOrigin(origin: string | undefined): string {
@@ -100,6 +172,18 @@ function json(payload: unknown, status: number): Response {
   });
 }
 
+function html(payload: string, status: number): Response {
+  const headers = new Headers({
+    "content-type": "text/html; charset=utf-8",
+    "x-proxied-by": "osv-mirror-worker",
+  });
+  applyCors(headers);
+  return new Response(payload, {
+    status,
+    headers,
+  });
+}
+
 function withCors(response: Response): Response {
   const headers = new Headers(response.headers);
   applyCors(headers);
@@ -114,4 +198,423 @@ function applyCors(headers: Headers): void {
   headers.set("access-control-allow-origin", "*");
   headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
   headers.set("access-control-allow-headers", "content-type,authorization");
+}
+
+async function serveVulnerabilityPage(requestUrl: URL, env: Env, vulnerabilityId: string): Promise<Response> {
+  const normalizedOrigin = normalizeOrigin(env.OSV_ORIGIN);
+  const upstreamUrl = `${normalizedOrigin}/v1/vulns/${encodeURIComponent(vulnerabilityId)}`;
+
+  try {
+    const upstreamResponse = await fetch(upstreamUrl, {
+      method: "GET",
+      headers: new Headers({ accept: "application/json" }),
+      redirect: "follow",
+    });
+
+    if (!upstreamResponse.ok) {
+      return html(
+        renderErrorPage(
+          vulnerabilityId,
+          `Unable to load mirrored OSV details from ${normalizedOrigin}. Upstream responded with ${upstreamResponse.status} ${upstreamResponse.statusText}.`,
+        ),
+        upstreamResponse.status,
+      );
+    }
+
+    const vulnerability = (await upstreamResponse.json()) as OsvVulnerability;
+    return html(renderVulnerabilityDetailPage(requestUrl, vulnerability), 200);
+  } catch (error) {
+    return html(
+      renderErrorPage(
+        vulnerabilityId,
+        error instanceof Error ? error.message : "Unknown error while querying the upstream OSV API.",
+      ),
+      502,
+    );
+  }
+}
+
+function renderVulnerabilityDetailPage(requestUrl: URL, vulnerability: OsvVulnerability): string {
+  const vulnerabilityId = vulnerability.id?.trim() || "Unknown vulnerability";
+  const title = vulnerability.summary?.trim() || vulnerabilityId;
+  const summary = vulnerability.summary?.trim() || "No summary provided.";
+  const detailSource = vulnerability.details?.trim() || summary;
+  const mirrorJsonUrl = `${requestUrl.origin}/v1/vulns/${encodeURIComponent(vulnerabilityId)}`;
+  const officialOsvUrl = `https://osv.dev/vulnerability/${encodeURIComponent(vulnerabilityId)}`;
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(vulnerabilityId)} · OSV Mirror</title>
+  <style>
+    :root {
+      --bg: #f5efe4;
+      --panel: #fffaf2;
+      --ink: #182126;
+      --muted: #627077;
+      --accent: #0b6e4f;
+      --border: #d9c9b2;
+      --shadow: 0 24px 48px rgba(24, 33, 38, 0.09);
+      --chip: #f2eadc;
+      --chip-ink: #5f4c2c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      color: var(--ink);
+      background: radial-gradient(circle at top left, #fff8eb, var(--bg) 58%, #ece3d2);
+      line-height: 1.55;
+    }
+    main {
+      width: min(1080px, calc(100vw - 32px));
+      margin: 28px auto 64px;
+    }
+    .hero, .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+      margin-bottom: 20px;
+    }
+    h1, h2 { margin-top: 0; }
+    h1 { margin-bottom: 8px; }
+    .lede, .meta-label, .empty, .severity-score, .affected-meta, .range-events { color: var(--muted); }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+      margin-top: 20px;
+    }
+    .meta-card, .severity-item, .reference-item, .affected-item, .range-card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 14px 16px;
+      background: #fffef9;
+    }
+    .meta-value, .severity-type, .reference-type, .affected-name, .range-head {
+      font-weight: 700;
+    }
+    .actions {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 18px;
+    }
+    .action {
+      display: inline-flex;
+      align-items: center;
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .action.secondary {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--ink);
+    }
+    .columns {
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.85fr);
+      gap: 20px;
+    }
+    .badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: var(--chip);
+      color: var(--chip-ink);
+      font-size: 0.92rem;
+    }
+    .severity-list, .reference-list, .affected-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      display: grid;
+      gap: 12px;
+    }
+    .details p {
+      margin: 0 0 14px;
+    }
+    .details p:last-child {
+      margin-bottom: 0;
+    }
+    .stack {
+      display: grid;
+      gap: 12px;
+    }
+    .reference-url, .range-link {
+      color: var(--accent);
+      text-decoration: none;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+    }
+    @media (max-width: 860px) {
+      main {
+        width: calc(100vw - 20px);
+        margin: 16px auto 32px;
+      }
+      .hero, .panel {
+        padding: 18px;
+        border-radius: 18px;
+      }
+      .columns {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <div class="badge-row">
+        <span class="badge">OSV Mirror</span>
+        <span class="badge">${escapeHtml(vulnerabilityId)}</span>
+      </div>
+      <h1>${escapeHtml(title)}</h1>
+      <p class="lede">${escapeHtml(summary)}</p>
+      <div class="actions">
+        <a class="action" href="${escapeHtml(mirrorJsonUrl)}" target="_blank" rel="noreferrer">Open mirrored JSON</a>
+        <a class="action secondary" href="${escapeHtml(officialOsvUrl)}" target="_blank" rel="noreferrer">Official OSV page</a>
+      </div>
+      <div class="meta-grid">
+        <div class="meta-card">
+          <div class="meta-label">Published</div>
+          <div class="meta-value">${escapeHtml(formatTimestamp(vulnerability.published))}</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Modified</div>
+          <div class="meta-value">${escapeHtml(formatTimestamp(vulnerability.modified))}</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Withdrawn</div>
+          <div class="meta-value">${escapeHtml(formatTimestamp(vulnerability.withdrawn))}</div>
+        </div>
+        <div class="meta-card">
+          <div class="meta-label">Aliases</div>
+          <div class="meta-value">${escapeHtml(renderAliasSummary(vulnerability.aliases))}</div>
+        </div>
+      </div>
+    </section>
+
+    <div class="columns">
+      <section class="panel">
+        <h2>Details</h2>
+        <div class="details">
+          ${renderTextBlocks(detailSource)}
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Severity</h2>
+        ${renderSeverityList(vulnerability.severity)}
+      </section>
+    </div>
+
+    <div class="columns">
+      <section class="panel">
+        <h2>Affected Packages</h2>
+        ${renderAffectedPackages(vulnerability.affected)}
+      </section>
+
+      <section class="panel">
+        <h2>References</h2>
+        ${renderReferenceList(vulnerability.references)}
+      </section>
+    </div>
+  </main>
+</body>
+</html>`;
+}
+
+function renderErrorPage(vulnerabilityId: string, message: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(vulnerabilityId)} · OSV Mirror Error</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", sans-serif;
+      background: #f7f1e7;
+      color: #182126;
+    }
+    main {
+      width: min(720px, calc(100vw - 32px));
+      margin: 48px auto;
+      padding: 24px;
+      background: #fffaf2;
+      border: 1px solid #d9c9b2;
+      border-radius: 20px;
+    }
+    p { color: #5f4c2c; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>${escapeHtml(vulnerabilityId)}</h1>
+    <p>${escapeHtml(message)}</p>
+  </main>
+</body>
+</html>`;
+}
+
+function renderAliasSummary(aliases: string[] | undefined): string {
+  const values = (aliases ?? []).map((alias) => alias.trim()).filter(Boolean);
+  return values.length > 0 ? values.join(", ") : "n/a";
+}
+
+function renderTextBlocks(text: string): string {
+  const normalized = text.trim();
+  if (!normalized) {
+    return '<p class="empty">No additional details provided.</p>';
+  }
+
+  return normalized
+    .split(/\r?\n\s*\r?\n/g)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean)
+    .map((paragraph) => `<p>${escapeHtml(paragraph).replace(/\r?\n/g, "<br>")}</p>`)
+    .join("");
+}
+
+function renderSeverityList(severity: OsvSeverity[] | undefined): string {
+  const entries = (severity ?? [])
+    .map((entry) => ({
+      type: entry.type?.trim() || "Score",
+      score: entry.score?.trim() || "unknown",
+    }))
+    .filter((entry) => entry.score.length > 0);
+
+  if (entries.length === 0) {
+    return '<p class="empty">No severity metadata provided.</p>';
+  }
+
+  return `<ul class="severity-list">${entries
+    .map(
+      (entry) => `<li class="severity-item"><div class="severity-type">${escapeHtml(entry.type)}</div><div class="severity-score">${escapeHtml(entry.score)}</div></li>`,
+    )
+    .join("")}</ul>`;
+}
+
+function renderReferenceList(references: OsvReference[] | undefined): string {
+  const seenUrls = new Set<string>();
+  const entries = (references ?? [])
+    .map((reference) => ({
+      type: reference.type?.trim() || "Reference",
+      url: reference.url?.trim() || "",
+    }))
+    .filter((reference) => reference.url.length > 0)
+    .filter((reference) => {
+      const key = reference.url.toLowerCase();
+      if (seenUrls.has(key)) {
+        return false;
+      }
+      seenUrls.add(key);
+      return true;
+    });
+
+  if (entries.length === 0) {
+    return '<p class="empty">No external references were provided.</p>';
+  }
+
+  return `<ul class="reference-list">${entries
+    .map(
+      (reference) => `<li class="reference-item"><div class="reference-type">${escapeHtml(humanizeIdentifier(reference.type))}</div><a class="reference-url" href="${escapeHtml(reference.url)}" target="_blank" rel="noreferrer">${escapeHtml(reference.url)}</a></li>`,
+    )
+    .join("")}</ul>`;
+}
+
+function renderAffectedPackages(affected: OsvAffectedPackage[] | undefined): string {
+  const entries = (affected ?? []).filter(
+    (entry) => entry.package || (entry.versions?.length ?? 0) > 0 || (entry.ranges?.length ?? 0) > 0,
+  );
+  if (entries.length === 0) {
+    return '<p class="empty">No affected package metadata provided.</p>';
+  }
+
+  return `<ul class="affected-list">${entries.map((entry) => renderAffectedPackage(entry)).join("")}</ul>`;
+}
+
+function renderAffectedPackage(entry: OsvAffectedPackage): string {
+  const packageLabel =
+    [entry.package?.ecosystem?.trim(), entry.package?.name?.trim()].filter(Boolean).join(" / ") ||
+    entry.package?.purl?.trim() ||
+    "Unknown package";
+  const versions = entry.versions?.filter((version) => version.trim().length > 0) ?? [];
+  const versionLine = versions.length > 0 ? `<div class="affected-meta">Versions: ${escapeHtml(versions.join(", "))}</div>` : "";
+  const ranges = renderAffectedRanges(entry.ranges);
+
+  return `<li class="affected-item"><div class="affected-name">${escapeHtml(packageLabel)}</div>${versionLine}${ranges}</li>`;
+}
+
+function renderAffectedRanges(ranges: OsvAffectedRange[] | undefined): string {
+  const entries = (ranges ?? []).filter((range) => (range.events?.length ?? 0) > 0 || (range.repo?.trim().length ?? 0) > 0);
+  if (entries.length === 0) {
+    return "";
+  }
+
+  return `<div class="stack">${entries.map((range) => renderAffectedRange(range)).join("")}</div>`;
+}
+
+function renderAffectedRange(range: OsvAffectedRange): string {
+  const events = (range.events ?? [])
+    .map((event) =>
+      Object.entries(event)
+        .filter(([, value]) => typeof value === "string" && value.trim().length > 0)
+        .map(([key, value]) => `${humanizeIdentifier(key)}: ${value}`)
+        .join(" • "),
+    )
+    .filter(Boolean);
+  const repoLink = range.repo?.trim()
+    ? `<a class="range-link" href="${escapeHtml(range.repo)}" target="_blank" rel="noreferrer">${escapeHtml(range.repo)}</a>`
+    : "";
+  const eventLine = events.length > 0 ? `<div class="range-events">${escapeHtml(events.join(" | "))}</div>` : "";
+
+  return `<div class="range-card"><div class="range-head">${escapeHtml(range.type?.trim() || "Unknown range")}</div>${repoLink}${eventLine}</div>`;
+}
+
+function humanizeIdentifier(value: string): string {
+  return value
+    .split(/[_\-\s]+/)
+    .filter(Boolean)
+    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function formatTimestamp(value: string | undefined): string {
+  if (!value || value.trim().length === 0) {
+    return "n/a";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.valueOf())) {
+    return value;
+  }
+  return parsed.toISOString();
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 }
