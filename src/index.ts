@@ -5,6 +5,9 @@ export interface Env {
 const DEFAULT_OSV_ORIGIN = "https://api.osv.dev";
 const SUPPORTED_PATHS = ["POST /v1/querybatch", "GET /v1/vulns/{id}", "GET /vulnerability/{id}"];
 export const MAX_QUERYBATCH_BYTES = 1_048_576;
+export const MAX_QUERYBATCH_QUERIES = 100;
+export const MAX_VULNERABILITY_ID_LENGTH = 256;
+export const UPSTREAM_FETCH_TIMEOUT_MS = 8_000;
 const EDGE_CACHE_MAX_AGE_SECONDS = 300;
 const BROWSER_CACHE_MAX_AGE_SECONDS = 60;
 const FORWARDED_UPSTREAM_HEADER_NAMES = ["accept", "content-type"] as const;
@@ -12,6 +15,15 @@ const FORWARDED_UPSTREAM_HEADER_NAMES = ["accept", "content-type"] as const;
 type RequestBodyReadResult =
   | { ok: true; body: Uint8Array }
   | { ok: false; status: 400 | 413; error: string };
+
+type QueryBatchValidationResult =
+  | { ok: true; body: string }
+  | {
+      ok: false;
+      status: 400 | 413 | 415;
+      error: string;
+      maxQueries?: number;
+    };
 
 interface OsvSeverity {
   type?: string;
@@ -61,9 +73,17 @@ interface OsvVulnerability {
   affected?: OsvAffectedPackage[];
 }
 
+class UpstreamTimeoutError extends Error {
+  constructor() {
+    super("Upstream OSV request timed out");
+    this.name = "UpstreamTimeoutError";
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+    const supportedApiPath = isSupportedApiPath(url.pathname, request.method);
 
     if (request.method === "OPTIONS") {
       return withCors(new Response(null, { status: 204 }));
@@ -82,11 +102,20 @@ export default {
     }
 
     const vulnerabilityPageId = getVulnerabilityPageId(url.pathname);
+    if (url.searchParams.size > 0 && (supportedApiPath || vulnerabilityPageId)) {
+      return json(
+        {
+          error: "Query parameters are not supported on this route",
+        },
+        400,
+      );
+    }
+
     if (request.method === "GET" && vulnerabilityPageId) {
       return serveVulnerabilityPage(url, env, vulnerabilityPageId, ctx);
     }
 
-    if (!isSupportedApiPath(url.pathname, request.method)) {
+    if (!supportedApiPath) {
       return json(
         {
           error: "Unsupported path",
@@ -104,8 +133,17 @@ export default {
       }
     }
 
-    let requestBody: Uint8Array | undefined;
+    let requestBody: string | undefined;
     if (request.method === "POST") {
+      if (!isJsonContentType(request.headers.get("content-type"))) {
+        return json(
+          {
+            error: "Content-Type must be application/json",
+          },
+          415,
+        );
+      }
+
       const bodyResult = await readRequestBodyWithinLimit(request, MAX_QUERYBATCH_BYTES);
       if (!bodyResult.ok) {
         return json(
@@ -116,14 +154,30 @@ export default {
           bodyResult.status,
         );
       }
-      requestBody = bodyResult.body;
+
+      const queryBatchResult = validateQueryBatchPayload(bodyResult.body);
+      if (!queryBatchResult.ok) {
+        return json(
+          {
+            error: queryBatchResult.error,
+            ...(queryBatchResult.maxQueries
+              ? {
+                  maxQueries: queryBatchResult.maxQueries,
+                }
+              : {}),
+          },
+          queryBatchResult.status,
+        );
+      }
+
+      requestBody = queryBatchResult.body;
     }
 
     const upstreamUrl = `${normalizeOrigin(env.OSV_ORIGIN)}${url.pathname}${url.search}`;
     const headers = buildUpstreamHeaders(request, url);
 
     try {
-      const upstreamResponse = await fetch(upstreamUrl, {
+      const upstreamResponse = await fetchUpstreamWithTimeout(upstreamUrl, {
         method: request.method,
         headers,
         body: requestBody,
@@ -152,10 +206,10 @@ export default {
     } catch (error) {
       return json(
         {
-          error: "Upstream OSV request failed",
+          error: error instanceof UpstreamTimeoutError ? error.message : "Upstream OSV request failed",
           details: error instanceof Error ? error.message : "Unknown error",
         },
-        502,
+        error instanceof UpstreamTimeoutError ? 504 : 502,
       );
     }
   },
@@ -168,7 +222,7 @@ export function isSupportedApiPath(pathname: string, method: string): boolean {
 
   if (pathname.startsWith("/v1/vulns/")) {
     const suffix = pathname.slice("/v1/vulns/".length);
-    return method === "GET" && suffix.length > 0 && !suffix.includes("/");
+    return method === "GET" && parseVulnerabilityIdSegment(suffix) !== null;
   }
 
   return false;
@@ -180,13 +234,20 @@ export function getVulnerabilityPageId(pathname: string): string | null {
   }
 
   const suffix = pathname.slice("/vulnerability/".length);
-  if (!suffix || suffix.includes("/")) {
+  return parseVulnerabilityIdSegment(suffix);
+}
+
+function parseVulnerabilityIdSegment(value: string): string | null {
+  if (!value || value.includes("/")) {
     return null;
   }
 
   try {
-    const vulnerabilityId = decodeURIComponent(suffix);
-    return vulnerabilityId && !vulnerabilityId.includes("/") ? vulnerabilityId : null;
+    const decoded = decodeURIComponent(value);
+    if (!decoded || decoded.includes("/") || decoded.length > MAX_VULNERABILITY_ID_LENGTH) {
+      return null;
+    }
+    return decoded;
   } catch {
     return null;
   }
@@ -205,7 +266,110 @@ function getApiCacheKey(url: URL, method: string): Request | null {
     return null;
   }
 
-  return new Request(url.toString(), { method: "GET" });
+  return new Request(`${url.origin}${url.pathname}`, { method: "GET" });
+}
+
+function isJsonContentType(contentType: string | null): boolean {
+  if (!contentType) {
+    return false;
+  }
+
+  const mediaType = contentType.split(";", 1)[0]?.trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
+function validateQueryBatchPayload(body: Uint8Array): QueryBatchValidationResult {
+  let decoded: string;
+  try {
+    decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body);
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      error: "Request body must be valid UTF-8 JSON",
+    };
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(decoded);
+  } catch {
+    return {
+      ok: false,
+      status: 400,
+      error: "Request body must be valid JSON",
+    };
+  }
+
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "querybatch body must be a JSON object",
+    };
+  }
+
+  const queries = (payload as Record<string, unknown>).queries;
+  if (!Array.isArray(queries)) {
+    return {
+      ok: false,
+      status: 400,
+      error: "querybatch body must include a queries array",
+    };
+  }
+
+  if (queries.length === 0) {
+    return {
+      ok: false,
+      status: 400,
+      error: "queries array must not be empty",
+    };
+  }
+
+  if (queries.length > MAX_QUERYBATCH_QUERIES) {
+    return {
+      ok: false,
+      status: 413,
+      error: "Too many queries in batch",
+      maxQueries: MAX_QUERYBATCH_QUERIES,
+    };
+  }
+
+  if (queries.some((query) => !query || typeof query !== "object" || Array.isArray(query))) {
+    return {
+      ok: false,
+      status: 400,
+      error: "Each query must be a JSON object",
+    };
+  }
+
+  return {
+    ok: true,
+    body: JSON.stringify(payload),
+  };
+}
+
+async function fetchUpstreamWithTimeout(input: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, UPSTREAM_FETCH_TIMEOUT_MS);
+
+  try {
+    return await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (timedOut) {
+      throw new UpstreamTimeoutError();
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 export function buildUpstreamHeaders(request: Request, url: URL): Headers {
@@ -345,7 +509,7 @@ async function serveVulnerabilityPage(
   vulnerabilityId: string,
   ctx: ExecutionContext,
 ): Promise<Response> {
-  const cacheKey = new Request(requestUrl.toString(), { method: "GET" });
+  const cacheKey = new Request(`${requestUrl.origin}${requestUrl.pathname}`, { method: "GET" });
   const cachedResponse = await caches.default.match(cacheKey);
   if (cachedResponse) {
     return cachedResponse;
@@ -355,7 +519,7 @@ async function serveVulnerabilityPage(
   const upstreamUrl = `${normalizedOrigin}/v1/vulns/${encodeURIComponent(vulnerabilityId)}`;
 
   try {
-    const upstreamResponse = await fetch(upstreamUrl, {
+    const upstreamResponse = await fetchUpstreamWithTimeout(upstreamUrl, {
       method: "GET",
       headers: new Headers({ accept: "application/json" }),
       redirect: "follow",
@@ -381,9 +545,13 @@ async function serveVulnerabilityPage(
     return html(
       renderErrorPage(
         vulnerabilityId,
-        error instanceof Error ? error.message : "Unknown error while querying the upstream OSV API.",
+        error instanceof UpstreamTimeoutError
+          ? error.message
+          : error instanceof Error
+            ? error.message
+            : "Unknown error while querying the upstream OSV API.",
       ),
-      502,
+      error instanceof UpstreamTimeoutError ? 504 : 502,
     );
   }
 }
