@@ -58,6 +58,12 @@ Type-check the Worker:
 npm run check
 ```
 
+Run the automated tests:
+
+```bash
+npm test
+```
+
 Deploy:
 
 ```bash
@@ -74,3 +80,15 @@ OSV_ORIGIN = "https://api.osv.dev"
 ```
 
 If you want the Worker to target a different OSV-compatible upstream later, change that variable and redeploy.
+
+## Security And Operations
+
+- The Worker forwards only the upstream headers it actually needs instead of proxying client `Authorization`, `Cookie`, or other ambient headers.
+- Successful `GET /v1/vulns/{id}` and `GET /vulnerability/{id}` responses are cached briefly to reduce latency and upstream load.
+- Open CORS is intentional so browser-based tools can call the mirror directly.
+- For public deployments, configure Cloudflare rate limiting rules at the zone or route level if you expect shared or untrusted traffic.
+- Local secret files such as `.dev.vars` and `.env*` are gitignored.
+
+## License
+
+This project is released under the MIT License. See `LICENSE`.

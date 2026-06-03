@@ -4,6 +4,14 @@ export interface Env {
 
 const DEFAULT_OSV_ORIGIN = "https://api.osv.dev";
 const SUPPORTED_PATHS = ["POST /v1/querybatch", "GET /v1/vulns/{id}", "GET /vulnerability/{id}"];
+export const MAX_QUERYBATCH_BYTES = 1_048_576;
+const EDGE_CACHE_MAX_AGE_SECONDS = 300;
+const BROWSER_CACHE_MAX_AGE_SECONDS = 60;
+const FORWARDED_UPSTREAM_HEADER_NAMES = ["accept", "content-type"] as const;
+
+type RequestBodyReadResult =
+  | { ok: true; body: Uint8Array }
+  | { ok: false; status: 400 | 413; error: string };
 
 interface OsvSeverity {
   type?: string;
@@ -54,7 +62,7 @@ interface OsvVulnerability {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -75,7 +83,7 @@ export default {
 
     const vulnerabilityPageId = getVulnerabilityPageId(url.pathname);
     if (request.method === "GET" && vulnerabilityPageId) {
-      return serveVulnerabilityPage(url, env, vulnerabilityPageId);
+      return serveVulnerabilityPage(url, env, vulnerabilityPageId, ctx);
     }
 
     if (!isSupportedApiPath(url.pathname, request.method)) {
@@ -88,28 +96,59 @@ export default {
       );
     }
 
+    const cacheKey = getApiCacheKey(url, request.method);
+    if (cacheKey) {
+      const cachedResponse = await caches.default.match(cacheKey);
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+    }
+
+    let requestBody: Uint8Array | undefined;
+    if (request.method === "POST") {
+      const bodyResult = await readRequestBodyWithinLimit(request, MAX_QUERYBATCH_BYTES);
+      if (!bodyResult.ok) {
+        return json(
+          {
+            error: bodyResult.error,
+            maxBytes: MAX_QUERYBATCH_BYTES,
+          },
+          bodyResult.status,
+        );
+      }
+      requestBody = bodyResult.body;
+    }
+
     const upstreamUrl = `${normalizeOrigin(env.OSV_ORIGIN)}${url.pathname}${url.search}`;
-    const headers = new Headers(request.headers);
-    headers.set("x-forwarded-host", url.host);
-    headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
+    const headers = buildUpstreamHeaders(request, url);
 
     try {
       const upstreamResponse = await fetch(upstreamUrl, {
         method: request.method,
         headers,
-        body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+        body: requestBody,
         redirect: "follow",
       });
 
       const responseHeaders = new Headers(upstreamResponse.headers);
+      responseHeaders.delete("set-cookie");
       responseHeaders.set("x-proxied-by", "osv-mirror-worker");
+      if (cacheKey && upstreamResponse.ok) {
+        applyPublicCacheHeaders(responseHeaders);
+      }
       applyCors(responseHeaders);
 
-      return new Response(upstreamResponse.body, {
+      const response = new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
         headers: responseHeaders,
       });
+
+      if (cacheKey && upstreamResponse.ok) {
+        ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+      }
+
+      return response;
     } catch (error) {
       return json(
         {
@@ -122,7 +161,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-function isSupportedApiPath(pathname: string, method: string): boolean {
+export function isSupportedApiPath(pathname: string, method: string): boolean {
   if (pathname === "/v1/querybatch") {
     return method === "POST";
   }
@@ -135,7 +174,7 @@ function isSupportedApiPath(pathname: string, method: string): boolean {
   return false;
 }
 
-function getVulnerabilityPageId(pathname: string): string | null {
+export function getVulnerabilityPageId(pathname: string): string | null {
   if (!pathname.startsWith("/vulnerability/")) {
     return null;
   }
@@ -161,6 +200,94 @@ function normalizeOrigin(origin: string | undefined): string {
   return value;
 }
 
+function getApiCacheKey(url: URL, method: string): Request | null {
+  if (method !== "GET" || !isSupportedApiPath(url.pathname, method)) {
+    return null;
+  }
+
+  return new Request(url.toString(), { method: "GET" });
+}
+
+export function buildUpstreamHeaders(request: Request, url: URL): Headers {
+  const headers = new Headers();
+
+  for (const headerName of FORWARDED_UPSTREAM_HEADER_NAMES) {
+    const value = request.headers.get(headerName);
+    if (value) {
+      headers.set(headerName, value);
+    }
+  }
+
+  headers.set("x-forwarded-host", url.host);
+  headers.set("x-forwarded-proto", url.protocol.replace(":", ""));
+  return headers;
+}
+
+export async function readRequestBodyWithinLimit(
+  request: Request,
+  maxBytes: number,
+): Promise<RequestBodyReadResult> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const size = Number.parseInt(contentLength, 10);
+    if (!Number.isFinite(size) || size < 0) {
+      return {
+        ok: false,
+        status: 400,
+        error: "Invalid Content-Length header",
+      };
+    }
+    if (size > maxBytes) {
+      return {
+        ok: false,
+        status: 413,
+        error: "Request body too large",
+      };
+    }
+  }
+
+  if (!request.body) {
+    return { ok: true, body: new Uint8Array() };
+  }
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+
+      const chunk = value ?? new Uint8Array();
+      totalBytes += chunk.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel();
+        return {
+          ok: false,
+          status: 413,
+          error: "Request body too large",
+        };
+      }
+
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+
+  const body = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+
+  return { ok: true, body };
+}
+
 function json(payload: unknown, status: number): Response {
   const headers = new Headers({
     "content-type": "application/json; charset=utf-8",
@@ -172,11 +299,14 @@ function json(payload: unknown, status: number): Response {
   });
 }
 
-function html(payload: string, status: number): Response {
+function html(payload: string, status: number, options: { cacheable?: boolean } = {}): Response {
   const headers = new Headers({
     "content-type": "text/html; charset=utf-8",
     "x-proxied-by": "osv-mirror-worker",
   });
+  if (options.cacheable) {
+    applyPublicCacheHeaders(headers);
+  }
   applyCors(headers);
   return new Response(payload, {
     status,
@@ -195,12 +325,32 @@ function withCors(response: Response): Response {
 }
 
 function applyCors(headers: Headers): void {
+  // Open CORS is intentional so browser-based tools can call the public mirror directly.
   headers.set("access-control-allow-origin", "*");
   headers.set("access-control-allow-methods", "GET,POST,OPTIONS");
-  headers.set("access-control-allow-headers", "content-type,authorization");
+  headers.set("access-control-allow-headers", "content-type");
+  headers.set("access-control-max-age", "86400");
 }
 
-async function serveVulnerabilityPage(requestUrl: URL, env: Env, vulnerabilityId: string): Promise<Response> {
+function applyPublicCacheHeaders(headers: Headers): void {
+  headers.set(
+    "cache-control",
+    `public, max-age=${BROWSER_CACHE_MAX_AGE_SECONDS}, s-maxage=${EDGE_CACHE_MAX_AGE_SECONDS}`,
+  );
+}
+
+async function serveVulnerabilityPage(
+  requestUrl: URL,
+  env: Env,
+  vulnerabilityId: string,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const cacheKey = new Request(requestUrl.toString(), { method: "GET" });
+  const cachedResponse = await caches.default.match(cacheKey);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
   const normalizedOrigin = normalizeOrigin(env.OSV_ORIGIN);
   const upstreamUrl = `${normalizedOrigin}/v1/vulns/${encodeURIComponent(vulnerabilityId)}`;
 
@@ -222,7 +372,11 @@ async function serveVulnerabilityPage(requestUrl: URL, env: Env, vulnerabilityId
     }
 
     const vulnerability = (await upstreamResponse.json()) as OsvVulnerability;
-    return html(renderVulnerabilityDetailPage(requestUrl, vulnerability), 200);
+    const response = html(renderVulnerabilityDetailPage(requestUrl, vulnerability), 200, {
+      cacheable: true,
+    });
+    ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
+    return response;
   } catch (error) {
     return html(
       renderErrorPage(
@@ -234,7 +388,7 @@ async function serveVulnerabilityPage(requestUrl: URL, env: Env, vulnerabilityId
   }
 }
 
-function renderVulnerabilityDetailPage(requestUrl: URL, vulnerability: OsvVulnerability): string {
+export function renderVulnerabilityDetailPage(requestUrl: URL, vulnerability: OsvVulnerability): string {
   const vulnerabilityId = vulnerability.id?.trim() || "Unknown vulnerability";
   const title = vulnerability.summary?.trim() || vulnerabilityId;
   const summary = vulnerability.summary?.trim() || "No summary provided.";
@@ -516,11 +670,18 @@ function renderSeverityList(severity: OsvSeverity[] | undefined): string {
 function renderReferenceList(references: OsvReference[] | undefined): string {
   const seenUrls = new Set<string>();
   const entries = (references ?? [])
-    .map((reference) => ({
-      type: reference.type?.trim() || "Reference",
-      url: reference.url?.trim() || "",
-    }))
-    .filter((reference) => reference.url.length > 0)
+    .map((reference) => {
+      const safeUrl = toSafeExternalUrl(reference.url);
+      if (!safeUrl) {
+        return null;
+      }
+
+      return {
+        type: reference.type?.trim() || "Reference",
+        url: safeUrl,
+      };
+    })
+    .filter((reference): reference is { type: string; url: string } => reference !== null)
     .filter((reference) => {
       const key = reference.url.toLowerCase();
       if (seenUrls.has(key)) {
@@ -565,7 +726,9 @@ function renderAffectedPackage(entry: OsvAffectedPackage): string {
 }
 
 function renderAffectedRanges(ranges: OsvAffectedRange[] | undefined): string {
-  const entries = (ranges ?? []).filter((range) => (range.events?.length ?? 0) > 0 || (range.repo?.trim().length ?? 0) > 0);
+  const entries = (ranges ?? []).filter(
+    (range) => (range.events?.length ?? 0) > 0 || toSafeExternalUrl(range.repo) !== null,
+  );
   if (entries.length === 0) {
     return "";
   }
@@ -582,19 +745,49 @@ function renderAffectedRange(range: OsvAffectedRange): string {
         .join(" • "),
     )
     .filter(Boolean);
-  const repoLink = range.repo?.trim()
-    ? `<a class="range-link" href="${escapeHtml(range.repo)}" target="_blank" rel="noreferrer">${escapeHtml(range.repo)}</a>`
+  const safeRepoUrl = toSafeExternalUrl(range.repo);
+  const repoLink = safeRepoUrl
+    ? `<a class="range-link" href="${escapeHtml(safeRepoUrl)}" target="_blank" rel="noreferrer">${escapeHtml(safeRepoUrl)}</a>`
     : "";
   const eventLine = events.length > 0 ? `<div class="range-events">${escapeHtml(events.join(" | "))}</div>` : "";
 
   return `<div class="range-card"><div class="range-head">${escapeHtml(range.type?.trim() || "Unknown range")}</div>${repoLink}${eventLine}</div>`;
 }
 
-function humanizeIdentifier(value: string): string {
+export function toSafeExternalUrl(value: string | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+export function humanizeIdentifier(value: string): string {
   return value
     .split(/[_\-\s]+/)
     .filter(Boolean)
-    .map((segment) => segment.charAt(0).toUpperCase() + segment.slice(1).toLowerCase())
+    .map((segment) => {
+      const lettersOnly = segment.replace(/[^A-Za-z]/g, "");
+      if (
+        lettersOnly.length >= 2 &&
+        lettersOnly.length <= 5 &&
+        lettersOnly === lettersOnly.toUpperCase() &&
+        segment !== segment.toLowerCase()
+      ) {
+        return segment;
+      }
+
+      return segment.charAt(0).toUpperCase() + segment.slice(1).toLowerCase();
+    })
     .join(" ");
 }
 
